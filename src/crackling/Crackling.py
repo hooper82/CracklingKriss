@@ -7,73 +7,19 @@ Config:
     - See config.ini
 '''
 
-import argparse
-import ast
-import csv
-import joblib
-import os
-import re
-import sys
-import time
-import tempfile
-import psutil
+import ast, csv, joblib, os, re, sys, time, tempfile
 
 from datetime import datetime
-
-from ConfigManager import ConfigManager
-from Paginator import Paginator
-from Batchinator import Batchinator
-from Constants import *
-from Helpers import *
 import multiprocessing as mp
 
-#########################################
-##   Removing targets with leading T   ##
-#########################################
+from crackling.Paginator import Paginator
+from crackling.Batchinator import Batchinator
+from crackling.Constants import *
+from crackling.Helpers import *
+from crackling.FileProcessor import find_candidates_in_file
 
 
-def removeT(key, lproxy):
-    d = lproxy[key]
-    if (key[-2:] == 'GG' and key[0] == 'T') or (key[:2] == 'CC' and key[-1] == 'A'):
-        d['passedAvoidLeadingT'] = CODE_REJECTED
-    else:
-        d['passedAvoidLeadingT'] = CODE_ACCEPTED
-    lproxy[key] = d
-
-#########################################
-##    AT% ideally is between 20-65%    ##
-#########################################
-
-
-def Ideal_AT(key, lproxy):
-    d = lproxy[key]
-    AT = AT_percentage(key[0:20])
-    if AT < 20 or AT > 65:
-        d['passedATPercent'] = CODE_REJECTED
-    else:
-        d['passedATPercent'] = CODE_ACCEPTED
-    d['AT'] = AT
-    lproxy[key] = d
-
-############################################
-##   Removing targets that contain TTTT   ##
-############################################
-
-
-def remove_TTTT(key, lproxy):
-    d = lproxy[key]
-    if 'TTTT' in key:
-        d['passedTTTT'] = CODE_REJECTED
-    else:
-        d['passedTTTT'] = CODE_ACCEPTED
-    lproxy[key] = d
-
-    #########################################
-    ##         sgRNAScorer 2.0 model       ##
-    #########################################
-
-
-def sgRNAScorer(key, lproxy):
+def sgRNAScorer(key, lproxy, sgrnascorer_model):
     d = lproxy[key]
 
     # binary encoding
@@ -84,7 +30,7 @@ def sgRNAScorer(key, lproxy):
         'H': '0111',    'D': '1101',    'N': '1111'
     }
 
-    clfLinear = joblib.load(configMngr['sgrnascorer2']['model'])
+    clfLinear = joblib.load(sgrnascorer_model)
 
     sequence = d.upper()
     entryList = []
@@ -106,16 +52,6 @@ def sgRNAScorer(key, lproxy):
     lproxy[key] = d
 
 
-def SecondsConversion(list):
-    totalTime = 0
-    totalTime += list[0] * 3600
-    totalTime += list[1] * 60
-    totalTime += list[2]
-    totalString = f'{totalTime}.' + str(list[3])
-    totalTime = float(totalString)
-    print(f'total time in seconds convertor = {totalTime}')
-    return totalTime
-
 
 def Crackling(configMngr):
     totalSizeBytes = configMngr.getDatasetSizeBytes()
@@ -128,8 +64,10 @@ def Crackling(configMngr):
     sys.stderr = configMngr.getErrLogMethod()
 
     lastRunTimeSec = 0
-    lastScaffoldSizeBytes = 0
+    seqFileSize = 0
     totalRunTimeSec = 0
+
+    startTime = time.time()
 
     ####################################
     ###     Run-time Optimisation     ##
@@ -151,12 +89,12 @@ def Crackling(configMngr):
 
             if optimisation == 'low':
                 # Never assess guides that appear twice
-                if (candidateGuides[target23]['seenDuplicate'] == CODE_REJECTED):
+                if (candidateGuides[target23]['isUnique'] == CODE_REJECTED):
                     doAssess = False
 
             if optimisation == 'medium':
                 # Never assess guides that appear twice
-                if (candidateGuides[target23]['seenDuplicate'] == CODE_REJECTED):
+                if (candidateGuides[target23]['isUnique'] == CODE_REJECTED):
                     doAssess = False
 
                 # For mm10db:
@@ -189,35 +127,52 @@ def Crackling(configMngr):
 
             if optimisation == 'high':
                 # Never assess guides that appear twice
-                if (candidateGuides[target23]['seenDuplicate'] == CODE_REJECTED):
+                if (candidateGuides[target23]['isUnique'] == CODE_REJECTED):
                     doAssess = False
 
-                # For mm10db:
-                if (module == MODULE_MM10DB):
-                    # if any of the mm10db tests have failed, then fail them all
-                    if (CODE_REJECTED in [
-                        candidateGuides[target23]['passedAvoidLeadingT'],
-                        candidateGuides[target23]['passedATPercent'],
-                        candidateGuides[target23]['passedTTTT'],
-                        candidateGuides[target23]['passedSecondaryStructure'],
-                        candidateGuides[target23]['acceptedByMm10db'],
-                    ]):
+                # For efficiency
+                if module in [MODULE_CHOPCHOP, MODULE_MM10DB, MODULE_SGRNASCORER2]:
+
+                    # `consensusCount` cannot be used yet as it may not have been
+                    # calculated. instead, calculate it on-the-go.
+                    countAlreadyAccepted = sum([
+                        candidateGuides[target23]['acceptedByMm10db'] == CODE_ACCEPTED,
+                        candidateGuides[target23]['passedG20'] == CODE_ACCEPTED,
+                        candidateGuides[target23]['acceptedBySgRnaScorer'] == CODE_ACCEPTED,
+                    ])
+
+                    countAlreadyAssessed = sum([
+                        candidateGuides[target23]['acceptedByMm10db'] in [CODE_ACCEPTED, CODE_REJECTED],
+                        candidateGuides[target23]['passedG20'] in [CODE_ACCEPTED, CODE_REJECTED],
+                        candidateGuides[target23]['acceptedBySgRnaScorer'] in [CODE_ACCEPTED, CODE_REJECTED],
+                    ])
+
+                    countToolsInConsensus = sum([
+                        configMngr['consensus'].getboolean('mm10db'),
+                        configMngr['consensus'].getboolean('chopchop'),
+                        configMngr['consensus'].getboolean('sgRNAScorer2'),
+                    ])
+
+                    # Do not assess if passed consensus already
+                    if countAlreadyAccepted >= consensusN:
                         doAssess = False
 
-                # For CHOPCHOP:
-                if (module == MODULE_CHOPCHOP):
-                    if consensusN == 1 and candidateGuides[target23]['acceptedByMm10db'] == CODE_ACCEPTED:
+                    # Do not assess if there are not enough remaining tests to pass consensus
+                    #   i.e. if the number of remaining tests is less than what is needed to pass then do not assess
+                    if countToolsInConsensus - countAlreadyAssessed < consensusN - countAlreadyAccepted:
                         doAssess = False
 
-                # For sgRNAScorer2:
-                if (module == MODULE_SGRNASCORER2):
-                    currentConsensus = ((int)(candidateGuides[target23]['acceptedByMm10db'] == CODE_ACCEPTED) +    # mm10db accepted
-                                        (int)(candidateGuides[target23]['passedG20'] == CODE_ACCEPTED))                            # chopchop-g20 accepted
-
-                    # if the guide is further than one test away from passing
-                    # the consensus approach, then skip it.
-                    if (currentConsensus < (consensusN - 1)):
-                        doAssess = False
+                    # For mm10db:
+                    if module == MODULE_MM10DB:
+                        # if any of the mm10db tests have failed, then fail them all
+                        if (CODE_REJECTED in [
+                            candidateGuides[target23]['passedAvoidLeadingT'],
+                            candidateGuides[target23]['passedATPercent'],
+                            candidateGuides[target23]['passedTTTT'],
+                            candidateGuides[target23]['passedSecondaryStructure'],
+                            candidateGuides[target23]['acceptedByMm10db'],
+                        ]):
+                            doAssess = False
 
                 # For specificity:
                 if (module == MODULE_SPECIFICITY):
@@ -232,21 +187,6 @@ def Crackling(configMngr):
             if doAssess:
                 yield target23
 
-    def processSequence(sequence):
-        # Patterns for guide matching
-        pattern_forward = r'(?=([ATCG]{21}GG))'
-        pattern_reverse = r'(?=(CC[ACGT]{21}))'
-
-        # New sequence deteced, process sequence
-        # once for forward, once for reverse
-        for pattern, strand, seqModifier in [
-            [pattern_forward, '+', lambda x: x],
-            [pattern_reverse, '-', lambda x: rc(x)]
-        ]:
-            p = re.compile(pattern)
-            for m in p.finditer(sequence):
-                target23 = seqModifier(seq[m.start(): m.start() + 23])
-                yield [target23, seqHeader,  m.start(),  m.start() + 23, strand]
 
     ###################################
     ##   Processing the input file   ##
@@ -259,106 +199,43 @@ def Crackling(configMngr):
     duplicateGuides = set()
     recordedSequences = set()
 
+    guideBatchinator = Batchinator(int(configMngr['input']['batch-size']))
+
+    printer(f'Batchinator is writing to: {guideBatchinator.workingDir.name}')
+
     for seqFilePath in configMngr.getIterFilesToProcess():
-        # Run start time
+
         start_time = time.time()
 
-        printer(f'Identifying possible target sites in: {seqFilePath}')
+        candidateGuides, duplicateGuides, recordedSequences, fileSize, numIdentifiedGuides, numDuplicateGuides = find_candidates_in_file(guideBatchinator, seqFilePath, candidateGuides, duplicateGuides, recordedSequences)
+        completedSizeBytes += fileSize
 
-        completedPercent = round(
-            (float(completedSizeBytes) / float(totalSizeBytes) * 100.0), 3)
-        printer(
-            f'{completedSizeBytes} of {totalSizeBytes} bytes processed ({completedPercent}%)')
+        duplicatePercent = round(numDuplicateGuides / numIdentifiedGuides * 100.0, 3)
+        printer(f'\tIdentified {numIdentifiedGuides:,} possible target sites in this file.')
+        printer(f'\tOf these, {len(duplicateGuides):,} are not unique. These sites occur a total of {numDuplicateGuides} times.')
+        printer(f'\tRemoving {numDuplicateGuides:,} of {numIdentifiedGuides:,} ({duplicatePercent}%) guides.')
+        printer(f'\t{len(candidateGuides):,} distinct guides have been discovered so far.')
 
-        lastScaffoldSizeBytes = os.path.getsize(seqFilePath)
-
-        completedSizeBytes += lastScaffoldSizeBytes
-
-        # We first remove all the line breaks within a given sequence (FASTA format)
-        with open(seqFilePath, 'r') as inFile, tempfile.NamedTemporaryFile(mode='w', delete=False) as parsedFile:
-            for line in inFile:
-                line = line.strip()
-                if line[0] == '>':
-                    # this is the header line for a new sequence, so we break the previous line and write the header as a new line
-                    parsedFile.write('\n'+line+'\n')
-                else:
-                    # this is (part of) the sequence; we write it without line break
-                    parsedFile.write(line.strip())
-
-        guideBatchinator = Batchinator(int(configMngr['input']['batch-size']))
-
-        with open(parsedFile.name, 'r') as inFile:
-            seqHeader = ''
-            seq = ''
-            for line in inFile:
-                # Remove garbage from line
-                line = line.strip()
-                # Some lines (e.g., first line in file) can be just a line break, move to next line
-                if line == '':
-                    continue
-                # Header line, start of a new sequence
-                elif line[0] == '>':
-                    # If we haven't seen the sequence OR we have found a sequence without header
-                    if (seqHeader not in recordedSequences) or (seqHeader == '' and seq != ''):
-                        # Record header
-                        recordedSequences.add(seqHeader)
-                        # Process the sequence
-                        for guide in processSequence(seq):
-                            # Check if guide has been seen before
-                            if guide[0] not in candidateGuides:
-                                # Record guide
-                                candidateGuides.add(guide[0])
-                                # Record candidate guide to temp file
-                                guideBatchinator.recordEntry(guide)
-                            else:
-                                # Record duplicate guide
-                                duplicateGuides.add(guide[0])
-                    # Update sequence and sequence header
-                    seqHeader = line[1:]
-                    seq = ''
-                # Sequence line, section of existing sequence
-                else:
-                    # Append section to total sequence
-                    seq += line.strip()
-
-            # Process the last sequence
-            for guide in processSequence(seq):
-                # Check if guide has been seen before
-                if guide[0] not in candidateGuides:
-                    # Record guide
-                    candidateGuides.add(guide[0])
-                    # Record candidate guide to temp file
-                    guideBatchinator.recordEntry(guide)
-                else:
-                    # Record duplicate guide
-                    duplicateGuides.add(guide[0])
-
-        printer(f'Identified {len(candidateGuides)} possible target sites.')
-
-        printer(
-            f'\t{len(duplicateGuides)} of {len(candidateGuides)} were seen more than once.')
-
-        # Update total time
-        preprocessingTime = time.time() - start_time
-        totalRunTimeSec += preprocessingTime
+        completedPercent = round(completedSizeBytes / totalSizeBytes * 100.0, 3)
+        printer(f'\tExtracted from {completedPercent}% of input')
 
     # Write header line for output file
     with open(configMngr['output']['file'], 'a+') as fOpen:
         csvWriter = csv.writer(fOpen, delimiter=configMngr['output']['delimiter'],
-                               quotechar='"', dialect='unix', quoting=csv.QUOTE_MINIMAL)
+                        quotechar='"',dialect='unix', quoting=csv.QUOTE_MINIMAL)
 
         csvWriter.writerow(DEFAULT_GUIDE_PROPERTIES_ORDER)
 
     # Clean up unused variables
-    os.unlink(parsedFile.name)
     del candidateGuides
     del recordedSequences
 
-    for batchFile in guideBatchinator:
-        # Run start time
-        start_time = time.time()
 
-        printer('Processing batch file...')
+    batchFileId = 0
+    for batchFile in guideBatchinator:
+        batchStartTime = time.time()
+
+        printer(f'Processing batch file {(batchFileId+1):,} of {len(guideBatchinator)}')
 
         # Create new candidate guide dictionary
         candidateGuides = {}
@@ -366,7 +243,7 @@ def Crackling(configMngr):
         with open(batchFile, 'r') as inputFp:
             # Create csv reader to parse temp file
             csvReader = csv.reader(inputFp, delimiter=configMngr['output']['delimiter'],
-                                   quotechar='"', dialect='unix', quoting=csv.QUOTE_MINIMAL)
+                quotechar='"',dialect='unix', quoting=csv.QUOTE_MINIMAL)
             # Rebuild dictonary from temp file
             for row in csvReader:
                 candidateGuides[row[0]] = DEFAULT_GUIDE_PROPERTIES.copy()
@@ -376,15 +253,14 @@ def Crackling(configMngr):
                     candidateGuides[row[0]]['start'] = CODE_AMBIGUOUS
                     candidateGuides[row[0]]['end'] = CODE_AMBIGUOUS
                     candidateGuides[row[0]]['strand'] = CODE_AMBIGUOUS
-                    candidateGuides[row[0]]['seenDuplicate'] = CODE_REJECTED
+                    candidateGuides[row[0]]['isUnique'] = CODE_REJECTED
                 else:
                     candidateGuides[row[0]]['header'] = row[1]
                     candidateGuides[row[0]]['start'] = row[2]
                     candidateGuides[row[0]]['end'] = row[3]
                     candidateGuides[row[0]]['strand'] = row[4]
 
-        printer(
-            f'Loaded batch {guideBatchinator.currentBatch} of {len(guideBatchinator.batchFiles)}')
+        printer(f'\tLoaded {len(candidateGuides):,} guides')
 
         ###################################
         ##        Multiprocessing        ##
@@ -400,7 +276,7 @@ def Crackling(configMngr):
 
         # Call function using starmap and shared result dict
         # this is where the multiprocessing is implemented, however it tends to add to runtime
-        pool.starmap(sgRNAScorer, [(key, mpd)
+        pool.starmap(sgRNAScorer, [(key, mpd, configMngr['sgrnascorer2']['model'])
                      for key in mpd])
         pool.close()
 
@@ -474,21 +350,5 @@ def Crackling(configMngr):
 
 
 if __name__ == '__main__':
-    # load in config
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-c', help='Configuration file',
-                        default=None, required=True)
-    args = parser.parse_args()
-
-    configMngr = ConfigManager(
-        args.c, lambda x: print(f'configMngr says: {x}'))
-
-    if not configMngr.isConfigured():
-        print('Something went wrong with reading the configuration.')
-        exit()
-    else:
-        printer('Crackling is starting...')
-
-        Crackling(configMngr)
-
-    print('Goodbye.')
+    print('This file is not callable')
+    exit(1)
