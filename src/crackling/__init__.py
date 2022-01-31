@@ -1,4 +1,4 @@
-from crackling.CracklingKriss import Crackling
+from crackling.Crackling import Crackling
 from crackling.ConfigManager import ConfigManager
 
 '''
